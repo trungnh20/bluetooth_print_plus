@@ -2,7 +2,7 @@
 enum BlueState { blueOn, blueOff }
 
 /// ConnectState
-enum ConnectState { connected, disconnected }
+enum ConnectState { connected, disconnected, error }
 
 /// Rotation
 enum Rotation { r_0, r_90, r_180, r_270 }

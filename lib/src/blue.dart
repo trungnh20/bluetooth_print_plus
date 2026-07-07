@@ -20,29 +20,27 @@ class BluetoothPrintPlus {
   }
 
   /// native platform methods channel
-  static final MethodChannel _methodChannel =
-      const MethodChannel("bluetooth_print_plus/methods");
+  static final MethodChannel _methodChannel = const MethodChannel("bluetooth_print_plus/methods");
 
   /// native platform events channel
-  static final EventChannel _stateChannel =
-      const EventChannel('bluetooth_print_plus/state');
-  static final StreamController<MethodCall> _methodStream =
-      StreamController.broadcast();
+  static final EventChannel _stateChannel = const EventChannel('bluetooth_print_plus/state');
+  static final StreamController<MethodCall> _methodStream = StreamController.broadcast();
 
   /// stream used for the scanResults public api
-  static final _scanResults =
-      StreamControllerReEmit<List<BluetoothDevice>>(initialValue: []);
+  static final _scanResults = StreamControllerReEmit<List<BluetoothDevice>>(initialValue: []);
 
   /// stream used for the isScanning public api
   static final _isScanning = StreamControllerReEmit<bool>(initialValue: false);
 
   /// stream used for the isConnected public api
-  static final _connectState = StreamControllerReEmit<ConnectState>(
-      initialValue: ConnectState.disconnected);
+  static final _connectState = StreamControllerReEmit<ConnectState?>(initialValue: null, debugName: 'connectState');
+
+  /// current connected device
+  static BluetoothDevice? _connectedDevice;
+  static BluetoothDevice? get connectedDevice => _connectedDevice;
 
   /// stream used for the isBlueOn public api
-  static final _blueState =
-      StreamControllerReEmit<BlueState>(initialValue: BlueState.blueOn);
+  static final _blueState = StreamControllerReEmit<BlueState>(initialValue: BlueState.blueOn);
 
   static PublishSubject _stopScanPill = new PublishSubject();
 
@@ -55,8 +53,11 @@ class BluetoothPrintPlus {
   /// returns whether we are scanning as a stream
   static Stream<bool> get isScanning => _isScanning.stream;
 
-  /// returns connect state as a stream
-  static Stream<ConnectState> get connectState => _connectState.stream;
+  /// returns connect state as a stream.
+  /// Only emits NEW events from native - does NOT re-emit last known state
+  /// to avoid spurious disconnected events when re-subscribing.
+  /// Use [isConnected] for point-in-time state checks.
+  static Stream<ConnectState> get connectState => _connectState.rawStream.where((s) => s != null).cast<ConnectState>();
 
   /// returns blue state as a stream
   static Stream<BlueState> get blueState => _blueState.stream;
@@ -65,11 +66,15 @@ class BluetoothPrintPlus {
   static bool get isScanningNow => _isScanning.latestValue;
 
   /// blue device is connected now?
-  static bool get isConnected =>
-      _connectState.latestValue == ConnectState.connected;
+  static bool get isConnected => _connectState.latestValue == ConnectState.connected;
 
   /// blue is on now?
   static bool get isBlueOn => _blueState.latestValue == BlueState.blueOn;
+
+  /// init bluetooth
+  static Future<void> initBluetooth() async {
+    await _methodChannel.invokeMethod('initBluetooth');
+  }
 
   /// the last known state
   static int? _stateNow;
@@ -88,7 +93,7 @@ class BluetoothPrintPlus {
   static Future startScan({
     Duration timeout = const Duration(seconds: 15),
   }) async {
-    _initFlutterBluePlus();
+    await _initFlutterBluePlus();
     if (isScanningNow) {
       await stopScan();
     }
@@ -123,6 +128,7 @@ class BluetoothPrintPlus {
   /// is reported on the `connectState` stream.
   static Future<dynamic> connect(BluetoothDevice device) async {
     await _methodChannel.invokeMethod('connect', device.toJson());
+    _connectedDevice = device;
   }
 
   /// Disconnects from the currently connected Bluetooth device.
@@ -133,6 +139,7 @@ class BluetoothPrintPlus {
   ///
   /// Returns a `Future` that completes when the disconnection process is finished.
   static Future<dynamic> disconnect() async {
+    _connectedDevice = null;
     await _methodChannel.invokeMethod('disconnect');
   }
 
@@ -150,11 +157,25 @@ class BluetoothPrintPlus {
 
   /// peripheral data feedback, receive and listen;
   static Stream<Uint8List> get receivedData async* {
-    yield* BluetoothPrintPlus._methodStream.stream
-        .where((m) => m.method == "ReceivedData")
-        .map((m) {
+    yield* BluetoothPrintPlus._methodStream.stream.where((m) => m.method == "ReceivedData").map((m) {
       return m.arguments;
     });
+  }
+
+  /// Emits `true` every time a write (print) job has been fully transmitted
+  /// to the printer over BLE.
+  ///
+  /// Usage:
+  /// ```dart
+  /// BluetoothPrintPlus.printCompleted.listen((done) {
+  ///   if (done) print('Print job sent!');
+  /// });
+  /// await BluetoothPrintPlus.write(data);
+  /// ```
+  static Stream<bool> get printCompleted async* {
+    yield* BluetoothPrintPlus._methodStream.stream
+        .where((m) => m.method == "PrintCompleted")
+        .map((m) => m.arguments == true);
   }
 
   /// Gets the current state of the Bluetooth module
@@ -178,7 +199,11 @@ class BluetoothPrintPlus {
         if (s == 2) {
           _connectState.add(ConnectState.connected);
         } else if (s == 3) {
+          _connectedDevice = null;
           _connectState.add(ConnectState.disconnected);
+        } else if (s == 4) {
+          _connectedDevice = null;
+          _connectState.add(ConnectState.error);
         }
       }
       return 1;
@@ -204,26 +229,44 @@ class BluetoothPrintPlus {
     _isScanning.add(true);
     // Clear scan results list
     _scanResults.add(<BluetoothDevice>[]);
-    // invoke startScan method
-    await _methodChannel.invokeMethod('startScan').onError((error, stackTrace) {
-      _stopScanPill.add(null);
-      _isScanning.add(false);
-    });
+
     final killStreams = <Stream>[]..add(_stopScanPill);
     killStreams.add(Rx.timer(null, timeout));
-    yield* BluetoothPrintPlus._methodStream.stream
+
+    // Dùng controller để bridge stream nhằm tránh mất kết quả trong lúc await native method
+    StreamController<BluetoothDevice> controller = StreamController();
+
+    final subscription = _methodStream.stream
         .where((m) => m.method == "ScanResult")
         .map((m) => m.arguments)
         .takeUntil(Rx.merge(killStreams))
-        .doOnDone(stopScan)
         .map((map) {
       final device = BluetoothDevice.fromJson(Map<String, dynamic>.from(map));
       final scanResults = _scanResults.value;
-      int index = scanResults
-          .indexWhere((element) => element.address == device.address);
+      int index = scanResults.indexWhere((element) => element.address == device.address);
       index == -1 ? scanResults.add(device) : scanResults[index] = device;
       _scanResults.add(scanResults);
       return device;
-    });
+    }).listen(
+      (device) => controller.add(device),
+      onError: (e) => controller.addError(e),
+      onDone: () {
+        stopScan();
+        controller.close();
+      },
+    );
+
+    // invoke startScan method
+    try {
+      await _methodChannel.invokeMethod('startScan');
+    } catch (e) {
+      _stopScanPill.add(null);
+      _isScanning.add(false);
+      subscription.cancel();
+      controller.close();
+      rethrow;
+    }
+
+    yield* controller.stream;
   }
 }
