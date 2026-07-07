@@ -4,7 +4,8 @@ public enum BPPState {
   BlueOn(0),
   BlueOff(1),
   DeviceConnected(2),
-  DeviceDisconnected(3);
+  DeviceDisconnected(3),
+  DeviceError(4);
 
   private final int value;
   BPPState(int value) {

@@ -73,6 +73,10 @@ public class BluetoothPrintPlusPlugin
   private final TscCommandPlugin tscCommandPlugin = new TscCommandPlugin();
   private final CpclCommandPlugin cpclCommandPlugin = new CpclCommandPlugin();
   private final EscCommandPlugin escCommandPlugin = new EscCommandPlugin();
+  private volatile boolean isConnecting = false;
+  private volatile boolean isConnected = false;
+  private final Handler mainHandler = new Handler(Looper.getMainLooper());
+  private Runnable pendingDisconnectRunnable = null;
 
   public BluetoothPrintPlusPlugin() {}
 
@@ -217,7 +221,11 @@ public class BluetoothPrintPlusPlugin
       if (BluetoothDevice.ACTION_FOUND.equals(action)) {
         BluetoothDevice device = intent.getParcelableExtra(BluetoothDevice.EXTRA_DEVICE);
         if (device == null || device.getName() == null) return;
-        if (device.getType() == DEVICE_TYPE_LE) return;
+        
+        // Trên Android, chỉ lấy thiết bị Classic (Type 1) để in ấn ổn định và nhanh nhất
+        // Loại bỏ Type 2 (LE) và Type 3 (Dual/BLE mode) để tránh lặp thiết bị
+        if (device.getType() != BluetoothDevice.DEVICE_TYPE_CLASSIC) return;
+
         BluetoothParameter parameter = new BluetoothParameter();
         int rssi = Objects.requireNonNull(intent.getExtras()).getShort(BluetoothDevice.EXTRA_RSSI);
         parameter.setBluetoothName(device.getName());
@@ -296,52 +304,74 @@ public class BluetoothPrintPlusPlugin
   }
 
   public void connect(final String mac) {
+    LogUtils.i(TAG, ">>> connect() called. mac=" + mac + ", isConnecting=" + isConnecting + ", isConnected=" + isConnected);
+    isConnecting = true;
+    isConnected = false;
+    cancelPendingDisconnect();
     ThreadPoolManager.getInstance().addTask(new Runnable() {
       @Override
       public void run() {
-        if (portManager != null) {
-          portManager.closePort();
-          try {
-            Thread.sleep(500);
-          } catch (InterruptedException e) {
-            throw new RuntimeException(e);
-          }
-        }
         if (mac != null) {
           PrinterDevices blueTooth = new PrinterDevices.Build()
                   .setContext(context)
                   .setConnMethod(ConnMethod.BLUETOOTH)
                   .setMacAddress(mac)
-                  .setCommand(Command.ESC)
+                  .setCommand(Command.TSC)
                   .setCallbackListener(new CallbackListener() {
                     @Override
-                    public void onConnecting() { }
+                    public void onConnecting() {
+                      LogUtils.i(TAG, ">>> onConnecting: isConnecting=" + isConnecting + ", isConnected=" + isConnected);
+                    }
 
                     @Override
                     public void onCheckCommand() { }
 
                     @Override
                     public void onSuccess(PrinterDevices printerDevices) {
-                      // LogUtils.d(TAG, "onSuccess");
-                      sink.success(BPPState.DeviceConnected.getValue());
+                      LogUtils.i(TAG, ">>> onSuccess: SENDING DeviceConnected. isConnecting=" + isConnecting + ", isConnected=" + isConnected);
+                      cancelPendingDisconnect();
+                      isConnecting = false;
+                      isConnected = true;
+                      mainHandler.post(() -> {
+                        LogUtils.i(TAG, ">>> [MainThread] sink.success(DeviceConnected)");
+                        if (sink != null) sink.success(BPPState.DeviceConnected.getValue());
+                      });
                     }
 
                     @Override
                     public void onReceive(byte[] data) {
                       if (data == null) return;
-                      // LogUtils.d(TAG, "Received Data: " + Arrays.toString(data));
-                      new Handler(Looper.getMainLooper()).post(() -> {
-                        channel.invokeMethod("ReceivedData", data);
+                      mainHandler.post(() -> {
+                        if (channel != null) channel.invokeMethod("ReceivedData", data);
                       });
                     }
 
                     @Override
-                    public void onFailure() { }
+                    public void onFailure() {
+                      LogUtils.e(TAG, ">>> onFailure: isConnecting=" + isConnecting + ", isConnected=" + isConnected + " → scheduleState(DeviceError, 600ms)");
+                      isConnecting = false;
+                      isConnected = false;
+                      scheduleState(BPPState.DeviceError, "onFailure");
+                    }
 
                     @Override
                     public void onDisconnect() {
-                      // LogUtils.d(TAG, "onDisconnect");
-                      sink.success(BPPState.DeviceDisconnected.getValue());
+                      LogUtils.i(TAG, ">>> onDisconnect: isConnecting=" + isConnecting + ", isConnected=" + isConnected);
+                      if (isConnecting) {
+                        LogUtils.i(TAG, ">>> onDisconnect SUPPRESSED (isConnecting=true)");
+                        isConnected = false;
+                        return;
+                      }
+                      if (isConnected) {
+                        LogUtils.e(TAG, ">>> onDisconnect: SENDING DeviceDisconnected (real disconnect)");
+                        isConnected = false;
+                        mainHandler.post(() -> {
+                          LogUtils.e(TAG, ">>> [MainThread] sink.success(DeviceDisconnected) from onDisconnect");
+                          if (sink != null) sink.success(BPPState.DeviceDisconnected.getValue());
+                        });
+                      } else {
+                        LogUtils.i(TAG, ">>> onDisconnect IGNORED (isConnected=false, isConnecting=false)");
+                      }
                     }
                   })
                   .build();
@@ -351,10 +381,40 @@ public class BluetoothPrintPlusPlugin
     });
   }
 
+  private void scheduleState(BPPState state, String reason) {
+    cancelPendingDisconnect();
+    LogUtils.e(TAG, ">>> scheduleState SCHEDULED: " + state.name() + " from " + reason + " (fires in 600ms)");
+    pendingDisconnectRunnable = () -> {
+      pendingDisconnectRunnable = null;
+      if (!isConnected && !isConnecting) {
+        LogUtils.e(TAG, ">>> [MainThread] scheduleState FIRED → SENDING " + state.name());
+        if (sink != null) sink.success(state.getValue());
+      } else {
+        LogUtils.i(TAG, ">>> scheduleState SUPPRESSED: isConnected=" + isConnected + ", isConnecting=" + isConnecting);
+      }
+    };
+    mainHandler.postDelayed(pendingDisconnectRunnable, 600);
+  }
+
+  private void cancelPendingDisconnect() {
+    if (pendingDisconnectRunnable != null) {
+      mainHandler.removeCallbacks(pendingDisconnectRunnable);
+      pendingDisconnectRunnable = null;
+      LogUtils.i(TAG, ">>> cancelPendingDisconnect: timer CANCELLED");
+    }
+  }
+
   @SuppressWarnings("unchecked")
   private boolean write(byte[] data) throws IOException {
     boolean result = Printer.getPortManager().writeDataImmediately(data);
     LogUtils.d(TAG, result ? "发送成功": "发送失败");
+    if (result) {
+      new Handler(Looper.getMainLooper()).post(() -> {
+        if (channel != null) {
+          channel.invokeMethod("PrintCompleted", true);
+        }
+      });
+    }
     return result;
   }
 

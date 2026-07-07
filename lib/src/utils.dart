@@ -6,23 +6,38 @@ import 'dart:async';
 //  2. the "latestValue" is re-emitted whenever the stream is listened to
 class StreamControllerReEmit<T> {
   T latestValue;
+  final String? _debugName;
 
   final StreamController<T> _controller = StreamController<T>.broadcast();
 
-  StreamControllerReEmit({required T initialValue})
-      : this.latestValue = initialValue;
+  StreamControllerReEmit({required T initialValue, String? debugName})
+      : this.latestValue = initialValue,
+        this._debugName = debugName;
 
   Stream<T> get stream {
     if (latestValue != null) {
+      print(
+          '[StreamControllerReEmit${_debugName != null ? "($_debugName)" : ""}] stream getter: RE-EMITTING latestValue=$latestValue');
       return _controller.stream.newStreamWithInitialValue(latestValue!);
     } else {
+      print(
+          '[StreamControllerReEmit${_debugName != null ? "($_debugName)" : ""}] stream getter: latestValue=null, no re-emit');
       return _controller.stream;
     }
+  }
+
+  /// Returns the underlying broadcast stream WITHOUT re-emitting the last value.
+  /// Use this when you want only new events, not the cached state.
+  Stream<T> get rawStream {
+    print(
+        '[StreamControllerReEmit${_debugName != null ? "($_debugName)" : ""}] rawStream getter: skipping re-emit, latestValue=$latestValue');
+    return _controller.stream;
   }
 
   T get value => latestValue;
 
   void add(T newValue) {
+    print('[StreamControllerReEmit${_debugName != null ? "($_debugName)" : ""}] add: $latestValue → $newValue');
     latestValue = newValue;
     _controller.add(newValue);
   }
@@ -31,11 +46,9 @@ class StreamControllerReEmit<T> {
     _controller.addError(error);
   }
 
-  void listen(Function(T) onData,
-      {Function? onError, void Function()? onDone, bool? cancelOnError}) {
+  void listen(Function(T) onData, {Function? onError, void Function()? onDone, bool? cancelOnError}) {
     onData(latestValue);
-    _controller.stream.listen(onData,
-        onError: onError, onDone: onDone, cancelOnError: cancelOnError);
+    _controller.stream.listen(onData, onError: onError, onDone: onDone, cancelOnError: cancelOnError);
   }
 
   Future<void> close() {
@@ -49,8 +62,7 @@ extension _StreamNewStreamWithInitialValue<T> on Stream<T> {
   }
 }
 
-class _NewStreamWithInitialValueTransformer<T>
-    extends StreamTransformerBase<T, T> {
+class _NewStreamWithInitialValueTransformer<T> extends StreamTransformerBase<T, T> {
   /// the initial value to push to the new stream
   final T initialValue;
 
